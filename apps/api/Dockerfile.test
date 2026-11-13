@@ -1,0 +1,16 @@
+# Test image: full dev dependencies + source + tests, runs vitest against a
+# real Postgres on the compose network. Kept separate from the lean runtime
+# image so tests never ship to production.
+FROM node:20-alpine
+WORKDIR /app
+RUN corepack enable
+
+COPY package.json pnpm-workspace.yaml ./
+COPY apps/api/package.json apps/api/package.json
+RUN pnpm install --filter @slotbook/api... --frozen-lockfile=false
+
+COPY apps/api apps/api
+WORKDIR /app/apps/api
+
+# Default: run the integration tests once.
+CMD ["pnpm", "test"]
