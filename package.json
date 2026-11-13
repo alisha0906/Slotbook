@@ -1,0 +1,16 @@
+{
+  "name": "slotbook",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Slotbook — a reliable mini-Calendly booking engine on Postgres",
+  "packageManager": "pnpm@9.0.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "pnpm --filter @slotbook/api dev",
+    "db:migrate": "pnpm --filter @slotbook/api db:migrate",
+    "db:seed": "pnpm --filter @slotbook/api db:seed"
+  }
+}

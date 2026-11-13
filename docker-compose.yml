@@ -1,0 +1,58 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: slotbook-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: slotbook
+      POSTGRES_PASSWORD: slotbook
+      POSTGRES_DB: slotbook
+    ports:
+      - "5432:5432"
+    volumes:
+      - slotbook-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U slotbook -d slotbook"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: slotbook-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://slotbook:slotbook@db:5432/slotbook
+      API_PORT: "4000"
+      HOLD_TTL_MINUTES: "5"
+      DEMO_HOST_EMAIL: demo@slotbook.test
+      DEMO_HOST_PASSWORD: demo1234
+      NODE_ENV: production
+    ports:
+      - "4000:4000"
+    # Runs migrations, seeds the demo host, then starts the API.
+    command: sh -c "node dist/db/migrate.js && node dist/db/seed.js && node dist/server.js"
+
+  # Integration / concurrency tests against the real Postgres. Not started by
+  # `docker compose up`; invoked explicitly (see README):
+  #   docker compose run --rm --build tests
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile.test
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://slotbook:slotbook@db:5432/slotbook
+    # Ensure the schema exists (idempotent), then run the test suite.
+    command: sh -c "pnpm exec tsx src/db/migrate.ts && pnpm test"
+
+volumes:
+  slotbook-pgdata:
