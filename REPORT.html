@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Slotbook — Engineering Report</title>
+<style>
+  :root {
+    --ink: #1a1d24;
+    --muted: #5b6472;
+    --accent: #2563eb;
+    --border: #d9dee6;
+    --code-bg: #f4f6f9;
+    --head-bg: #f0f3f8;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body {
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    line-height: 1.55;
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 48px 40px;
+    font-size: 15px;
+  }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 {
+    font-size: 19px;
+    margin: 34px 0 10px;
+    padding-bottom: 6px;
+    border-bottom: 2px solid var(--accent);
+  }
+  h3 { font-size: 15.5px; margin: 20px 0 6px; }
+  p { margin: 8px 0; }
+  .subtitle { color: var(--muted); font-size: 15px; margin-top: 0; }
+  a { color: var(--accent); text-decoration: none; word-break: break-all; }
+  ul { margin: 8px 0; padding-left: 22px; }
+  li { margin: 4px 0; }
+  strong { color: #0f1320; }
+
+  code {
+    font-family: "Cascadia Code", "SF Mono", Consolas, "Liberation Mono", monospace;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 0.88em;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 12.5px;
+    line-height: 1.45;
+  }
+  pre code { background: none; padding: 0; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 13.5px;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 7px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--head-bg); font-weight: 600; }
+  tr:nth-child(even) td { background: #fafbfd; }
+
+  .tag {
+    display: inline-block;
+    background: #dcfce7;
+    color: #166534;
+    border-radius: 999px;
+    padding: 0 8px;
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  @page { margin: 18mm 16mm; }
+  @media print {
+    body { padding: 0; max-width: none; font-size: 12.5px; }
+    h2 { break-after: avoid; }
+    pre, table { break-inside: avoid; }
+    h1, h2, h3 { break-after: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Slotbook — Engineering Report</h1>
+<p class="subtitle">
+  A small, reliable Calendly-style booking engine. Hosts publish availability,
+  guests book slots, and <strong>nobody is ever double-booked</strong> — even under
+  concurrent requests, clock skew, or a misbehaving client. Postgres is the single
+  source of truth for correctness.
+</p>
+
+<h2>1. Links</h2>
+<ul>
+  <li><strong>Repository:</strong> <em>&lt;add your public GitHub URL here&gt;</em></li>
+  <li><strong>Live URL:</strong> <em>not deployed (runs locally via <code>docker compose up</code>)</em></li>
+</ul>
+<p><strong>Run locally:</strong></p>
+<pre><code>docker compose up --build        # starts Postgres + API, migrates, seeds
+# open http://localhost:4000</code></pre>
+<p><strong>Tests (concurrency vs real Postgres):</strong></p>
+<pre><code>docker compose up -d db
+docker compose run --rm --build tests</code></pre>
+<p>
+  Seeded demo host: <code>demo@slotbook.test</code> / <code>demo1234</code>, time zone
+  <code>America/New_York</code>, with event types <code>intro-call</code> (30 min,
+  one-on-one) and <code>group-office</code> (60 min, capacity 5).
+</p>
+
+<h2>2. Architecture</h2>
+<pre><code>                     Browser (React + Vite SPA)
+        ┌───────────────────────┬────────────────────────┐
+        │  /demo/intro-call      │  /dashboard             │
+        │  public booking page   │  host (authenticated)   │
+        │  /manage/:token        │                         │
+        └───────────┬───────────┴────────────┬────────────┘
+                    │  fetch /api/*  (same origin)
+                    ▼
+          ┌─────────────────────────────────────────┐
+          │           Fastify API (Node, TS)         │
+          │  routes/booking.ts   routes/host.ts      │
+          │  domain/slots.ts     domain/bookings.ts  │
+          │  domain/eventTypes   domain/notifications│
+          │  worker.ts  (hold-expiry sweep)          │
+          │  serves built SPA from web-dist          │
+          └───────────────────┬──────────────────────┘
+                              │  SQL (pg Pool, explicit txns)
+                              ▼
+                    ┌───────────────────────┐
+                    │     Postgres 15        │
+                    │  source of truth;      │
+                    │  advisory locks +      │
+                    │  constraints enforce   │
+                    │  no double-booking     │
+                    └───────────────────────┘</code></pre>
+
+<p><strong>How a booking request flows (the hot path):</strong></p>
+<ul>
+  <li>Guest opens <code>/{host}/{event-slug}</code>. The SPA calls
+    <code>GET /api/hosts/{host}/events/{slug}/slots?tz=...</code>.</li>
+  <li>The API loads the event type + its weekly rules and date overrides, generates
+    candidate slots in UTC (time-zone aware), subtracts active holds/confirmed per
+    slot, and returns only slots with remaining capacity.</li>
+  <li>Guest picks a slot → <code>POST /api/holds</code> with an
+    <code>Idempotency-Key</code>. The API opens a transaction, takes a Postgres
+    advisory lock keyed on <code>(event_type_id, slot_start)</code>, checks
+    idempotency, checks capacity, inserts a <code>held</code> row with
+    <code>hold_expires_at = now() + 5 min</code>, commits.</li>
+  <li>Guest enters name/email within 5 minutes →
+    <code>POST /api/holds/{id}/confirm</code>. Status flips to <code>confirmed</code>;
+    a <code>booking_confirmed</code> row is written to the notifications sink; the
+    guest receives a private <code>manage_token</code>.</li>
+  <li><code>reschedule</code> and <code>cancel</code> move or cancel the booking,
+    each emitting a notification.</li>
+  <li>A background worker sweeps expired holds to <code>expired</code> every 30 s.
+    Correctness does not depend on it (see §5).</li>
+</ul>
+<p>
+  <strong>Single-origin deployment.</strong> The production image builds the React app
+  and Fastify serves the static bundle, so the whole app lives on
+  <code>localhost:4000</code> with no CORS and one port.
+</p>
+
+<h2>3. Data model</h2>
+<p>
+  All instants are stored as <code>timestamptz</code> (UTC). Availability is stored as
+  local wall-clock time plus the host's IANA time zone, and converted to UTC instants
+  at slot-generation time.
+</p>
+<table>
+  <thead><tr><th>Table</th><th>Key columns</th><th>Notable constraints</th></tr></thead>
+  <tbody>
+    <tr><td><code>hosts</code></td><td>id, slug (unique), email (unique), timezone, password_hash</td><td>—</td></tr>
+    <tr><td><code>event_types</code></td><td>host_id→hosts, slug, duration_min, capacity, buffer_before_min, buffer_after_min, min_notice_min, horizon_days</td><td>duration 15–120, buffers 0–30, capacity ≥ 1, horizon ≥ 1; unique (host_id, slug)</td></tr>
+    <tr><td><code>availability_rules</code></td><td>event_type_id, weekday 0–6, start_time, end_time</td><td>weekday 0–6, end_time &gt; start_time</td></tr>
+    <tr><td><code>date_overrides</code></td><td>event_type_id, override_date, is_closed, start_time?, end_time?</td><td>closed OR a valid window</td></tr>
+    <tr><td><code>bookings</code></td><td>event_type_id, slot_start, slot_end, status, hold_expires_at, guest_name, guest_email, manage_token, idempotency_key, cancel_reason</td><td>unique manage_token; unique (event_type_id, idempotency_key); index (event_type_id, slot_start, status)</td></tr>
+    <tr><td><code>notifications</code></td><td>booking_id?, type, payload (JSON), created_at</td><td>—</td></tr>
+  </tbody>
+</table>
+<p>
+  <strong>Status enum:</strong> <code>held → confirmed → cancelled</code>; an
+  unconfirmed hold becomes <code>expired</code>.
+  <strong>Capacity counts only <code>confirmed</code> and non-expired
+  <code>held</code> rows</strong> — never <code>expired</code> or
+  <code>cancelled</code>.
+</p>
+<p><strong>Constraints that back correctness:</strong></p>
+<ul>
+  <li>Unique <code>(event_type_id, idempotency_key)</code> — a retried hold creates at most one row.</li>
+  <li>Unique, random <code>manage_token</code> — the guest's capability link is unguessable.</li>
+  <li>Index <code>(event_type_id, slot_start, status)</code> — fast capacity counts per slot.</li>
+</ul>
+
+<h2>4. Key decisions</h2>
+<ul>
+  <li><strong>Postgres advisory locks for no-double-booking</strong> (vs. unique index / SERIALIZABLE).
+    A partial unique index works for capacity = 1 but not group capacity &gt; 1.
+    SERIALIZABLE adds retries and cross-slot contention. A transaction-scoped advisory
+    lock keyed on <code>(event_type_id, slot_start)</code> serializes only the requests
+    that actually contend, handles any capacity, and needs no first row to lock.</li>
+  <li><strong>Expiry is advisory, not load-bearing.</strong> Capacity queries treat a
+    <code>held</code> row with <code>hold_expires_at ≤ now()</code> as free, so a hold
+    stops consuming capacity the instant it expires, whether or not the sweep has run.</li>
+  <li><strong>Idempotency inside the slot lock.</strong> The <code>Idempotency-Key</code>
+    row is unique per <code>(event_type_id, key)</code>, and the check runs after the
+    lock, so a retried request resolves to the existing hold rather than racing capacity
+    (a real bug we fixed — see §5 / AI_LOG).</li>
+  <li><strong>Store wall-clock availability + IANA zone; convert to UTC per date.</strong>
+    Storing availability as UTC would break across DST. Local time + zone, converted per
+    date with Luxon, keeps 09:00 at 09:00 local year-round and shifts the UTC instant at
+    DST boundaries (see §6).</li>
+  <li><strong>Node (Fastify) + React (Vite), single-origin.</strong> A small Fastify API
+    with explicit SQL transactions keeps the correctness-critical code obvious; serving
+    the built SPA from the same server removes CORS and gives a one-URL demo.</li>
+  <li><strong>Server re-validates every requested slot.</strong> Clients send an explicit
+    <code>slotStart</code>; the server regenerates the schedule and confirms the instant
+    is genuinely bookable (within notice + horizon) before holding.</li>
+  <li><strong>Seeded "token = host id" auth, documented as a gap.</strong> The brief permits
+    a seeded login. Full sessions/JWT + password hashing are out of core scope; the simple
+    token still enforces the public-vs-host boundary and host-scoping of queries.</li>
+</ul>
+
+<h2>5. Reliability</h2>
+<p>Failure cases identified and designed for, each with the test that proves it.</p>
+<table>
+  <thead><tr><th>Failure case</th><th>How the system handles it</th><th>Proven by</th></tr></thead>
+  <tbody>
+    <tr><td>Two guests race for the last seat</td><td>Each hold takes an advisory lock on (event_type_id, slot_start); capacity checked inside the lock; only one inserts.</td><td>50 simultaneous holds on capacity-1 → exactly <strong>1</strong> succeeds, 49 get <code>slot_full</code>, DB confirms 1 active row.</td></tr>
+    <tr><td>Group capacity exceeded under load</td><td>Same lock + count; stops exactly at capacity.</td><td>40 simultaneous holds on capacity-5 → exactly <strong>5</strong> succeed.</td></tr>
+    <tr><td>Client retries a hold (blip / double-click)</td><td>Idempotency-Key unique per event type; check inside the lock; retry returns the same hold.</td><td>20 concurrent holds, one key → <strong>1</strong> booking, same id to all; 23505 fallback re-reads winner.</td></tr>
+    <tr><td>Guest never confirms a hold</td><td>hold_expires_at = now()+5m; capacity treats expired holds as free immediately; worker marks them expired.</td><td>Capacity query excludes held AND expired; sequential test shows a full slot blocks.</td></tr>
+    <tr><td>pg returns timestamp as string, not Date</td><td>toIso() normalizes Date | string on every serialize/compare.</td><td>Fixed after first hold crashed; guest flow confirmed end-to-end.</td></tr>
+    <tr><td>POST body not parsed (frontend)</td><td>API client sends Content-Type: application/json on every write.</td><td>Fixed header-merge bug; hold/confirm/cancel work in the browser.</td></tr>
+    <tr><td>Reschedule into a full slot</td><td>Destination slot locked and capacity-checked (excluding the moving booking) before the move; fails closed.</td><td>rescheduleBooking advisory lock + count; returns slot_full if full.</td></tr>
+  </tbody>
+</table>
+<p>
+  The concurrency suite runs against a <strong>real Postgres</strong> (no mocks) via
+  <code>docker compose run --rm --build tests</code> — <span class="tag">4/4 passing</span>.
+</p>
+
+<h2>6. Time zones (with a DST worked example)</h2>
+<p>
+  <strong>Generation.</strong> Availability is stored as local wall-clock windows (e.g.
+  Mon–Fri 09:00–17:00) in the host's IANA zone. To produce slots we walk each calendar
+  day <em>in the host zone</em>, build each window's start/end as a Luxon
+  <code>DateTime</code> in that zone (so the correct UTC offset for that date is applied),
+  then convert to UTC. Candidate starts step by <code>duration + buffers</code>.
+</p>
+<p>
+  <strong>Display.</strong> Slots are returned as UTC instants plus a localized label; the
+  guest page converts UTC → the chosen browser zone, with a time-zone switcher.
+</p>
+<p>
+  <strong>Worked DST example — America/New_York spring-forward, 9 March 2025.</strong>
+  On that date clocks move forward: 02:00 EST (<code>-05:00</code>) jumps to 03:00 EDT
+  (<code>-04:00</code>), so wall-clock 02:00–02:59 does not exist.
+</p>
+<ul>
+  <li>A 09:00 local slot <strong>before</strong> DST (Fri 7 Mar 2025) is EST
+    <code>-05:00</code>: <code>09:00 -05:00</code> → <strong>14:00Z</strong>.</li>
+  <li>A 09:00 local slot <strong>after</strong> DST (Mon 10 Mar 2025) is EDT
+    <code>-04:00</code>: <code>09:00 -04:00</code> → <strong>13:00Z</strong>.</li>
+</ul>
+<p>
+  So the <em>same</em> "9 AM" availability correctly maps to a <strong>different UTC
+  instant</strong> across the transition — the engine never hard-codes an offset. If a
+  window ever covered the skipped hour, Luxon resolves the non-existent local time
+  forward, and because slots must fit entirely inside the window, no impossible slot is
+  emitted. (Observed live: a November New York slot returns
+  <code>startLocal ...T09:00:00-05:00</code> → <code>startUtc ...T14:00:00Z</code>, i.e.
+  EST, as expected.)
+</p>
+
+<h2>7. Optional extensions</h2>
+<p>
+  None of the optional extensions were built — the time was spent making the core and its
+  reliability solid (concurrency-safe capacity, idempotency, DST-correct slots, the
+  real-Postgres concurrency suite). The architecture leaves clear seams:
+</p>
+<ul>
+  <li><strong>Waitlist / reminders / webhooks</strong> fit naturally on the existing
+    notifications sink and the bookings lifecycle.</li>
+  <li><strong>Daily cap / per-guest limit</strong> are additional checks inside the same
+    hold transaction.</li>
+  <li><strong>Observability</strong> — a <code>/health</code> endpoint already exists;
+    structured logs via Fastify's logger are in place.</li>
+</ul>
+
+<h2>8. Testing</h2>
+<ul>
+  <li><strong>Covered:</strong> the concurrency/reliability core — single-seat race, group
+    capacity, idempotency under concurrency, and a sequential full-slot block — all against
+    a real Postgres.</li>
+  <li><strong>How to run:</strong>
+    <pre><code>docker compose up -d db
+docker compose run --rm --build tests</code></pre></li>
+  <li><strong>Results:</strong> 4/4 passing — capacity-1 race (50 → 1), capacity-5 race
+    (40 → 5), idempotency (20 same-key → 1 booking), sequential sanity.</li>
+  <li><strong>Gaps:</strong> unit tests for slot generation / DST edges, end-to-end browser
+    tests, and a k6/Artillery load test with p95 numbers. Slot logic was verified by hand
+    against the running API.</li>
+</ul>
+
+<h2>9. Using AI</h2>
+<p>
+  See <code>AI_LOG.md</code> for detail. In short: AI was strong at scaffolding, schema +
+  constraints, and the Luxon time-zone math, and weak at runtime edge cases that only
+  appear when the code runs — a <code>pg</code> <code>Date | string</code> quirk, an
+  idempotency-vs-capacity ordering race (caught by the concurrency test), and a frontend
+  header-merge bug that dropped <code>Content-Type</code>. Every bug was found by running
+  the stack, so the loop was build → run → verify on each step.
+</p>
+
+<h2>10. Known gaps and next steps</h2>
+<ul>
+  <li><strong>Auth is seeded/simple.</strong> Host "token" is the host id and passwords are
+    compared in plain text (the brief permits a seeded login). Next: hash passwords, issue
+    signed, expiring sessions, invalidate on logout.</li>
+  <li><strong>Host CRUD is partly via seed.</strong> Event-type and availability editing are
+    seeded rather than exposed as full dashboard forms; the tables and API support adding them.</li>
+  <li><strong>No optional extensions yet</strong> (waitlist, reminders, .ics, webhooks, etc.).</li>
+  <li><strong>Test depth.</strong> Add unit tests for slot generation (including DST),
+    Playwright e2e for the guest flow, CI on every push, and a k6 load test with throughput /
+    p95 / error-rate numbers.</li>
+  <li><strong>Observability.</strong> <code>/health</code> and structured logs exist; add
+    request IDs and basic metrics (bookings, hold expiries, notification lag).</li>
+</ul>
+<p>
+  <strong>With another day:</strong> password hashing + real sessions, host availability
+  editing UI, a waitlist built on the notifications sink, and a k6 load test with reported
+  p95 latency.
+</p>
+
+</body>
+</html>
